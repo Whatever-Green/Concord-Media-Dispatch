@@ -4,10 +4,12 @@ import shutil
 import exifread
 import hashlib
 import json
-import re           # NEW: For sanitizing filenames
-import ctypes       # NEW: For querying Windows hardware drive types
+import re           
+import ctypes       
+import subprocess   
 from datetime import datetime
 from pathlib import Path
+from PIL import Image 
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, 
                              QVBoxLayout, QLabel, QPushButton, QTreeView, 
@@ -23,43 +25,25 @@ from PyQt6.QtMultimediaWidgets import QVideoWidget
 
 # --- SECURITY & UTILITY ENGINES ---
 def sanitize_filename(name):
-    """Removes illegal characters from user-input strings to prevent OS crashes."""
     return re.sub(r'[\\/*?:"<>|]', "", name)
 
 def is_safe_to_wipe(source_dir):
-    """
-    A multi-layered security check to ensure we aren't formatting a crucial hard drive.
-    Returns: (bool is_safe, str warning_message)
-    """
     path = Path(source_dir).resolve()
-    drive = path.anchor # E.g., 'C:\' or '/'
-
-    # 1. System Boot Drive Check (Absolute Hard Lock)
+    drive = path.anchor 
     sys_drive = Path(os.path.abspath(sys.prefix)).anchor
     if drive == sys_drive:
         return False, f"CRITICAL LOCKOUT: The source is on your System Boot Drive ({sys_drive}). Wiping is disabled."
-
-    # 2. Capacity Check (Soft Warning if > 600GB)
     try:
-        total_bytes = shutil.disk_usage(path).total
-        total_gb = total_bytes / (1024**3)
+        total_gb = shutil.disk_usage(path).total / (1024**3)
         if total_gb > 600: 
-            return False, f"WARNING: The source drive is unusually large ({total_gb:.0f} GB). This does not appear to be a standard camera card."
-    except Exception:
-        pass
-
-    # 3. Removable Drive Heuristic Check
-    if os.name == 'nt': # Windows
-        drive_letter = drive.replace('\\', '')
-        # GetDriveTypeW returns 2 for DRIVE_REMOVABLE, 3 for FIXED
-        drive_type = ctypes.windll.kernel32.GetDriveTypeW(drive_letter)
-        if drive_type != 2: 
-            return False, f"WARNING: Drive {drive_letter} is not registering in Windows as a Removable device. It may be a local hard drive."
-    else: # Mac/Linux
-        path_str = str(path)
-        if not path_str.startswith('/Volumes/') and not path_str.startswith('/media/'):
-            return False, "WARNING: The source does not appear to be mounted as a removable volume (e.g., /Volumes/ or /media/)."
-
+            return False, f"WARNING: The source drive is unusually large ({total_gb:.0f} GB)."
+    except Exception: pass
+    if os.name == 'nt': 
+        if ctypes.windll.kernel32.GetDriveTypeW(drive.replace('\\', '')) != 2: 
+            return False, "WARNING: Drive is not registering as Removable."
+    else: 
+        if not str(path).startswith('/Volumes/') and not str(path).startswith('/media/'):
+            return False, "WARNING: Source is not mounted as a removable volume."
     return True, "Safe"
 
 def get_media_date(file_path):
@@ -74,8 +58,7 @@ def get_media_date(file_path):
                     return dt.strftime("%Y"), dt.strftime("%m"), dt.strftime("%d"), date_str
         except Exception: pass 
     try:
-        timestamp = os.path.getmtime(file_path)
-        dt = datetime.fromtimestamp(timestamp)
+        dt = datetime.fromtimestamp(os.path.getmtime(file_path))
         return dt.strftime("%Y"), dt.strftime("%m"), dt.strftime("%d"), dt.strftime("%Y-%m-%d %H:%M:%S")
     except Exception: return "Unknown", "Unknown", "Unknown", "Unknown Time"
 
@@ -96,7 +79,8 @@ class ScanWorker(QThread):
         super().__init__()
         self.source_dir = Path(source_dir)
     def run(self):
-        media_extensions = {'.jpg', '.jpeg', '.png', '.mp4', '.mov', '.cr2', '.arw'}
+        # Added .mpg and .mpeg support here
+        media_extensions = {'.jpg', '.jpeg', '.png', '.mp4', '.mov', '.cr2', '.arw', '.mpg', '.mpeg'}
         found_count = 0
         self.status_update.emit("Scanning directories...")
         for file_path in self.source_dir.rglob('*'):
@@ -126,31 +110,42 @@ class DispatchWorker(QThread):
         for row, item in enumerate(self.dispatch_plan):
             src_file_path = item['src']
             primary_dest = item['dest']
+            convert_ext = item.get('convert_ext', '') 
             
-            src_hash = calculate_sha256(src_file_path)
-            if not src_hash: continue
+            self.status_update.emit(f"Processing: {Path(src_file_path).name}")
 
-            primary_success = self._safe_copy(src_file_path, primary_dest, src_hash)
-            
+            conversion_failed = False
+            if convert_ext:
+                self.status_update.emit(f"Converting to {convert_ext.upper()}: {Path(src_file_path).name}...")
+                primary_success = self._convert_media(src_file_path, primary_dest, convert_ext)
+                if not primary_success: conversion_failed = True
+            else:
+                src_hash = calculate_sha256(src_file_path)
+                if not src_hash: continue
+                primary_success = self._safe_copy(src_file_path, primary_dest, src_hash)
+
             backup_success = True
-            if self.backup_dir:
+            if self.backup_dir and not conversion_failed:
                 try:
                     relative_route = Path(primary_dest).relative_to(item['base_dest'])
                     backup_dest = self.backup_dir / relative_route
-                    backup_success = self._safe_copy(src_file_path, backup_dest, src_hash)
                 except ValueError:
-                    # Bug Fix: If relative_to fails because paths are on different drives, fallback to a flat structure
                     backup_dest = self.backup_dir / Path(primary_dest).name
+
+                if convert_ext and primary_success:
+                    backup_success = self._safe_copy(primary_dest, backup_dest, calculate_sha256(primary_dest))
+                else:
                     backup_success = self._safe_copy(src_file_path, backup_dest, src_hash)
 
             if primary_success and backup_success:
                 success_count += 1
-                self.audit_log.append({"filename": Path(primary_dest).name, "status": "SUCCESS", "hash": src_hash})
+                final_hash = calculate_sha256(primary_dest)
+                self.audit_log.append({"filename": Path(primary_dest).name, "status": "SUCCESS", "hash": final_hash})
                 if self.wipe_source:
                     try: os.remove(src_file_path)
-                    except Exception as e: print(f"Failed to wipe {src_file_path}: {e}")
+                    except Exception as e: print(f"Wipe failed: {e}")
             else:
-                self.audit_log.append({"filename": Path(src_file_path).name, "status": "FAILED_VERIFICATION"})
+                self.audit_log.append({"filename": Path(src_file_path).name, "status": "FAILED"})
                 
             self.progress_update.emit(row + 1)
         self.finished.emit(success_count, total_count, self.audit_log)
@@ -158,37 +153,67 @@ class DispatchWorker(QThread):
     def _safe_copy(self, src, dest, src_hash):
         target_dir = Path(dest).parent
         target_dir.mkdir(parents=True, exist_ok=True)
-        tmp_file_path = target_dir / (Path(src).name + ".concord_tmp")
+        tmp_path = target_dir / (Path(src).name + ".concord_tmp")
         try:
-            shutil.copy2(src, tmp_file_path)
-            os.replace(tmp_file_path, dest)
-            dest_hash = calculate_sha256(dest)
-            if src_hash == dest_hash: return True
+            shutil.copy2(src, tmp_path)
+            os.replace(tmp_path, dest)
+            if src_hash == calculate_sha256(dest): return True
             if Path(dest).exists(): os.remove(dest) 
             return False
         except Exception:
-            if tmp_file_path.exists():
-                try: os.remove(tmp_file_path)
+            if tmp_path.exists():
+                try: os.remove(tmp_path)
                 except: pass
             return False
 
-# --- UI DIALOGS (SchemaEditorDialog & PreviewDialog remain unchanged from previous version) ---
+    def _convert_media(self, src, dest, ext):
+        target_dir = Path(dest).parent
+        target_dir.mkdir(parents=True, exist_ok=True)
+        
+        if ext in {'.jpg', '.jpeg', '.png', '.webp'}:
+            try:
+                with Image.open(src) as img:
+                    if ext in {'.jpg', '.jpeg'} and img.mode in ('RGBA', 'P'):
+                        img = img.convert('RGB')
+                    img.save(dest, quality=95)
+                return True
+            except Exception as e:
+                print(f"Image Conversion Error: {e}")
+                return False
+                
+        # Added .mpg and .mpeg support to the FFmpeg transcoder
+        elif ext in {'.mp4', '.mov', '.mkv', '.mpg', '.mpeg'}:
+            try:
+                command = ['ffmpeg', '-y', '-i', src, '-c:v', 'libx264', '-preset', 'fast', '-crf', '22', dest]
+                subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                return True
+            except FileNotFoundError:
+                print("FFmpeg not found! Please install FFmpeg to enable video conversion.")
+                return False
+            except subprocess.CalledProcessError as e:
+                print(f"Video Conversion Error: {e}")
+                return False
+        return False
+
+
+# --- DIALOGS ---
 class PreviewDialog(QDialog):
     def __init__(self, dispatch_plan, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Pre-Flight Review")
         self.resize(1000, 500)
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("<b>Review Routing & Naming Plan.</b>"))
+        layout.addWidget(QLabel("<b>Review Routing & Conversion Plan.</b>"))
         self.table = QTableWidget()
-        self.table.setColumnCount(3) 
-        self.table.setHorizontalHeaderLabels(["Original File", "New Name", "Primary Destination"])
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.setColumnCount(4) 
+        self.table.setHorizontalHeaderLabels(["Original File", "New Name", "Convert To", "Primary Destination"])
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self.table.setRowCount(len(dispatch_plan))
         for row, item in enumerate(dispatch_plan):
             self.table.setItem(row, 0, QTableWidgetItem(Path(item['src']).name))
             self.table.setItem(row, 1, QTableWidgetItem(Path(item['dest']).name))
-            self.table.setItem(row, 2, QTableWidgetItem(str(Path(item['dest']).parent)))
+            self.table.setItem(row, 2, QTableWidgetItem(item.get('convert_ext', 'None')))
+            self.table.setItem(row, 3, QTableWidgetItem(str(Path(item['dest']).parent)))
         layout.addWidget(self.table)
         self.btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         self.btn_box.accepted.connect(self.accept)
@@ -198,48 +223,81 @@ class PreviewDialog(QDialog):
 class SchemaEditorDialog(QDialog):
     def __init__(self, current_schema, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Advanced Schema Manager")
-        self.resize(850, 500) 
+        self.setWindowTitle("Smart Schema Builder")
+        self.resize(850, 600) 
         self.schema_data = current_schema 
 
         layout = QVBoxLayout(self)
-        lbl_inst = QLabel("<b>Rule-Based Routing & Renaming</b><br>Available Tags: <code>[YYYY], [MM], [DD], [EXT], [CUSTOM], [SEQ]</code>")
-        layout.addWidget(lbl_inst)
-
-        def_group = QGroupBox("Default Fallback (If no rules match)")
-        def_layout = QHBoxLayout()
-        def_layout.addWidget(QLabel("Route:"))
-        self.txt_def_route = QLineEdit(self.schema_data.get("default_route", "[YYYY]/[MM]/[DD]"))
-        def_layout.addWidget(self.txt_def_route)
         
-        def_layout.addWidget(QLabel("Rename:"))
+        def_group = QGroupBox("1. Default Behavior (If no special rules match)")
+        def_group.setToolTip("These settings apply if a file does not match any of the rules below.")
+        def_layout = QHBoxLayout()
+        def_layout.addWidget(QLabel("Route To:"))
+        self.txt_def_route = QLineEdit(self.schema_data.get("default_route", "[YYYY]/[MM]/[DD]"))
+        self.txt_def_route.setToolTip("Dynamic folder creation. Use [YYYY], [MM], [EXT], etc.")
+        def_layout.addWidget(self.txt_def_route)
+        def_layout.addWidget(QLabel("Rename To:"))
         self.txt_def_name = QLineEdit(self.schema_data.get("default_name", "[YYYY][MM][DD]_[CUSTOM]_[SEQ]"))
-        def_layout.addWidget(self.txt_def_name)
         def_group.setLayout(def_layout)
         layout.addWidget(def_group)
 
-        self.table = QTableWidget()
-        self.table.setColumnCount(3)
-        self.table.setHorizontalHeaderLabels(["If Extension (e.g. .mp4)", "Route To Pattern", "Rename To Pattern"])
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        layout.addWidget(self.table)
-
-        rules = self.schema_data.get("rules", [])
-        self.table.setRowCount(len(rules))
-        for r, rule in enumerate(rules):
-            self.table.setItem(r, 0, QTableWidgetItem(rule.get("exts", "")))
-            self.table.setItem(r, 1, QTableWidgetItem(rule.get("route", "")))
-            self.table.setItem(r, 2, QTableWidgetItem(rule.get("name", "")))
-
-        btn_layout = QHBoxLayout()
-        btn_add = QPushButton("+ Add Rule")
-        btn_add.clicked.connect(self.add_rule)
-        btn_remove = QPushButton("- Remove Selected")
+        list_group = QGroupBox("2. Active Smart Rules (Read from top to bottom)")
+        list_layout = QVBoxLayout()
+        self.rule_list = QListView()
+        self.rule_model = QStandardItemModel()
+        self.rule_list.setModel(self.rule_model)
+        list_layout.addWidget(self.rule_list)
+        btn_remove = QPushButton("- Remove Selected Rule")
         btn_remove.clicked.connect(self.remove_rule)
-        btn_layout.addWidget(btn_add)
-        btn_layout.addWidget(btn_remove)
-        layout.addLayout(btn_layout)
+        list_layout.addWidget(btn_remove)
+        list_group.setLayout(list_layout)
+        layout.addWidget(list_group)
+
+        build_group = QGroupBox("3. Build a New Rule")
+        build_layout = QVBoxLayout()
+        
+        if_layout = QHBoxLayout()
+        if_layout.addWidget(QLabel("<b>IF</b>"))
+        self.combo_type = QComboBox()
+        self.combo_type.addItems(["Extension", "Date Taken"])
+        if_layout.addWidget(self.combo_type)
+        
+        self.combo_operator = QComboBox()
+        self.combo_operator.addItems(["is exactly", "is before", "is after"])
+        if_layout.addWidget(self.combo_operator)
+        
+        self.txt_value = QLineEdit()
+        self.txt_value.setPlaceholderText("e.g. .mp4 or 2008-01-01")
+        if_layout.addWidget(self.txt_value)
+        build_layout.addLayout(if_layout)
+        
+        then_layout = QHBoxLayout()
+        then_layout.addWidget(QLabel("<b>THEN</b> Route To:"))
+        self.txt_rule_route = QLineEdit()
+        self.txt_rule_route.setPlaceholderText("e.g. Needs_Review/")
+        then_layout.addWidget(self.txt_rule_route)
+        
+        then_layout.addWidget(QLabel("Rename To:"))
+        self.txt_rule_name = QLineEdit()
+        self.txt_rule_name.setPlaceholderText("Leave blank to keep original")
+        then_layout.addWidget(self.txt_rule_name)
+        
+        then_layout.addWidget(QLabel("Convert To:"))
+        self.txt_rule_convert = QLineEdit()
+        self.txt_rule_convert.setPlaceholderText("e.g. .jpg or .mp4")
+        self.txt_rule_convert.setToolTip("Converts the media file. Requires FFmpeg for video. Leave blank to keep original format.")
+        then_layout.addWidget(self.txt_rule_convert)
+
+        build_layout.addLayout(then_layout)
+
+        btn_add = QPushButton("+ Add Smart Rule")
+        btn_add.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
+        btn_add.clicked.connect(self.add_rule)
+        build_layout.addWidget(btn_add)
+        build_group.setLayout(build_layout)
+        layout.addWidget(build_group)
+
+        for rule in self.schema_data.get("rules", []): self._add_rule_to_ui(rule)
 
         io_layout = QHBoxLayout()
         btn_import = QPushButton("Import Schema (.json)")
@@ -255,25 +313,42 @@ class SchemaEditorDialog(QDialog):
         self.btn_box.rejected.connect(self.reject)
         layout.addWidget(self.btn_box)
 
-    def add_rule(self): self.table.insertRow(self.table.rowCount())
+    def _add_rule_to_ui(self, rule_dict):
+        sentence = f"IF {rule_dict['type']} {rule_dict['operator']} '{rule_dict['value']}' ➔ ROUTE: {rule_dict['route']}"
+        if rule_dict.get('name'): sentence += f" | RENAME: {rule_dict['name']}"
+        if rule_dict.get('convert'): sentence += f" | CONVERT TO: {rule_dict['convert']}"
+        item = QStandardItem(sentence)
+        item.setData(rule_dict, Qt.ItemDataRole.UserRole) 
+        self.rule_model.appendRow(item)
+
+    def add_rule(self):
+        r_type = self.combo_type.currentText()
+        r_op = self.combo_operator.currentText()
+        r_val = self.txt_value.text().strip()
+        r_route = self.txt_rule_route.text().strip()
+        r_name = self.txt_rule_name.text().strip()
+        r_convert = self.txt_rule_convert.text().strip().lower() 
+        
+        if not r_val or not r_route:
+            QMessageBox.warning(self, "Missing Info", "You must provide a Value and a Route pattern.")
+            return
+            
+        new_rule = {"type": r_type, "operator": r_op, "value": r_val, "route": r_route, "name": r_name, "convert": r_convert}
+        self._add_rule_to_ui(new_rule)
+        self.txt_value.clear()
+        self.txt_rule_route.clear()
+        self.txt_rule_name.clear()
+        self.txt_rule_convert.clear()
+
     def remove_rule(self):
-        for item in self.table.selectedItems(): self.table.removeRow(item.row())
+        for index in self.rule_list.selectedIndexes(): self.rule_model.removeRow(index.row())
 
     def save_and_accept(self):
         self.schema_data["default_route"] = self.txt_def_route.text()
         self.schema_data["default_name"] = self.txt_def_name.text()
         rules = []
-        for row in range(self.table.rowCount()):
-            ext_item = self.table.item(row, 0)
-            route_item = self.table.item(row, 1)
-            name_item = self.table.item(row, 2)
-            ext_text = ext_item.text().strip() if ext_item else ""
-            if ext_text:
-                rules.append({
-                    "exts": ext_text.lower(), 
-                    "route": route_item.text() if route_item else "",
-                    "name": name_item.text() if name_item else ""
-                })
+        for row in range(self.rule_model.rowCount()):
+            rules.append(self.rule_model.item(row).data(Qt.ItemDataRole.UserRole))
         self.schema_data["rules"] = rules
         self.accept()
 
@@ -291,19 +366,12 @@ class SchemaEditorDialog(QDialog):
                 with open(file_path, 'r') as f: self.schema_data = json.load(f)
                 self.txt_def_route.setText(self.schema_data.get("default_route", ""))
                 self.txt_def_name.setText(self.schema_data.get("default_name", ""))
-                rules = self.schema_data.get("rules", [])
-                self.table.setRowCount(len(rules))
-                for r, rule in enumerate(rules):
-                    self.table.setItem(r, 0, QTableWidgetItem(rule.get("exts", "")))
-                    self.table.setItem(r, 1, QTableWidgetItem(rule.get("route", "")))
-                    self.table.setItem(r, 2, QTableWidgetItem(rule.get("name", "")))
-            except Exception as e:
-                QMessageBox.warning(self, "Error", f"Failed to load schema: {e}")
-
+                self.rule_model.clear()
+                for rule in self.schema_data.get("rules", []): self._add_rule_to_ui(rule)
+            except Exception as e: QMessageBox.warning(self, "Error", f"Failed to load schema: {e}")
 
 # --- MAIN APPLICATION ---
 class ConcordDispatchApp(QMainWindow):
-    # __init__ and UI layout remains exactly the same as the previous iteration
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Concord Media Dispatch (Studio Edition)")
@@ -314,8 +382,8 @@ class ConcordDispatchApp(QMainWindow):
             "default_route": "[YYYY]/[MM]/[DD]",
             "default_name": "[YYYY][MM][DD]_[CUSTOM]_[SEQ]",
             "rules": [
-                {"exts": ".mp4, .mov", "route": "[YYYY]/Videos", "name": "[YYYY]_[CUSTOM]_CAM_[SEQ]"},
-                {"exts": ".cr2, .arw", "route": "[YYYY]/RAW_Photos/[MM]", "name": "[YYYY]_[CUSTOM]_RAW_[SEQ]"}
+                {"type": "Date Taken", "operator": "is before", "value": "2008-01-01", "route": "Flagged_Dates/", "name": "BAD_DATE_[SEQ]", "convert": ""},
+                {"type": "Extension", "operator": "is exactly", "value": ".mov, .mpg, .mpeg", "route": "Converted_Proxies/", "name": "[CUSTOM]_PROXY_[SEQ]", "convert": ".mp4"}
             ]
         }
 
@@ -325,11 +393,12 @@ class ConcordDispatchApp(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         main_layout.addWidget(splitter)
 
-        # Pane 1
+        # --- Pane 1 ---
         from_pane_widget = QWidget()
         from_pane = QVBoxLayout(from_pane_widget)
         from_pane.addWidget(QLabel("<b>FROM: Source Drive</b>"))
         self.btn_select_source = QPushButton("Select Source...")
+        self.btn_select_source.setToolTip("Select the SD Card or external drive you want to ingest media from.")
         self.source_tree = QTreeView()
         self.file_model = QFileSystemModel()
         self.file_model.setRootPath("") 
@@ -339,7 +408,7 @@ class ConcordDispatchApp(QMainWindow):
         from_pane.addWidget(self.source_tree)
         splitter.addWidget(from_pane_widget)
 
-        # Pane 2
+        # --- Pane 2 ---
         garner_pane_widget = QWidget()
         garner_pane = QVBoxLayout(garner_pane_widget)
         garner_pane.addWidget(QLabel("<b>GARNER: Staging & Review</b>"))
@@ -405,6 +474,7 @@ class ConcordDispatchApp(QMainWindow):
 
         self.lbl_preview_meta = QLabel("Metadata will appear here.")
         self.btn_scan_media = QPushButton("Scan Source")
+        self.btn_scan_media.setToolTip("Scans the selected source drive for images and video formats.")
         self.lbl_garner_status = QLabel("0 files queued")
 
         garner_pane.addWidget(self.btn_scan_media)
@@ -414,7 +484,7 @@ class ConcordDispatchApp(QMainWindow):
         garner_pane.addWidget(self.lbl_garner_status)
         splitter.addWidget(garner_pane_widget)
 
-        # Pane 3
+        # --- Pane 3 ---
         dispatch_pane_widget = QWidget()
         dispatch_pane = QVBoxLayout(dispatch_pane_widget)
         dispatch_pane.addWidget(QLabel("<b>DISPATCH: Routing & Actions</b>"))
@@ -437,8 +507,9 @@ class ConcordDispatchApp(QMainWindow):
         schema_group = QGroupBox("Schemas")
         schema_layout = QVBoxLayout()
         self.combo_schema = QComboBox()
-        self.combo_schema.addItems(["Year / Month / Day", "Year / Month", "Flat Directory", "Advanced Rule-Based Manager..."])
-        self.btn_edit_schema = QPushButton("Configure Advanced Schema...")
+        self.combo_schema.addItems(["Year / Month / Day", "Year / Month", "Flat Directory", "Smart Schema Builder..."])
+        self.combo_schema.setToolTip("Defines how folders are automatically created based on metadata.")
+        self.btn_edit_schema = QPushButton("Configure Smart Schema...")
         self.btn_edit_schema.setVisible(False)
         self.btn_edit_schema.clicked.connect(self.open_schema_editor)
 
@@ -447,6 +518,7 @@ class ConcordDispatchApp(QMainWindow):
         schema_layout.addWidget(self.btn_edit_schema)
         schema_layout.addWidget(QLabel("Job Name / Custom Tag [CUSTOM]:"))
         self.txt_custom_tag = QLineEdit()
+        self.txt_custom_tag.setToolTip("Text entered here will replace the [CUSTOM] tag in your Smart Schema rules.")
         schema_layout.addWidget(self.txt_custom_tag)
         schema_group.setLayout(schema_layout)
         dispatch_pane.addWidget(schema_group)
@@ -456,6 +528,7 @@ class ConcordDispatchApp(QMainWindow):
         self.combo_post_action = QComboBox()
         self.combo_post_action.addItems(["Do Nothing (Default)", "Close Application", "⚠️ WIPE SOURCE MEDIA"])
         self.combo_post_action.setStyleSheet("QComboBox QAbstractItemView::item:selected { background-color: darkred; }")
+        self.combo_post_action.setToolTip("Choose what the app does automatically after all files are verified.")
         action_layout.addWidget(self.combo_post_action)
         action_group.setLayout(action_layout)
         dispatch_pane.addWidget(action_group)
@@ -464,6 +537,7 @@ class ConcordDispatchApp(QMainWindow):
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
         self.btn_dispatch = QPushButton("DISPATCH SELECTED")
+        self.btn_dispatch.setToolTip("Executes your rules, conversions, copies, and verification.")
         self.btn_dispatch.setMinimumHeight(50)
         self.btn_dispatch.setStyleSheet("background-color: #2E8B57; color: white; font-weight: bold;")
         
@@ -532,7 +606,8 @@ class ConcordDispatchApp(QMainWindow):
         item_name.setCheckState(Qt.CheckState.Checked) 
         if ext in {'.jpg', '.jpeg', '.png'}:
             item_name.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon))
-        elif ext in {'.mp4', '.mov'}:
+        # Added .mpg and .mpeg to UI video icons
+        elif ext in {'.mp4', '.mov', '.mpg', '.mpeg'}:
             item_name.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaVolume))
         item_ext = QStandardItem(ext)
         item_date = QStandardItem(full_date)
@@ -575,7 +650,8 @@ class ConcordDispatchApp(QMainWindow):
             pixmap = QPixmap(file_path)
             pixmap = pixmap.scaled(self.lbl_preview_image.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             self.lbl_preview_image.setPixmap(pixmap)
-        elif path_obj.suffix.lower() in {'.mp4', '.mov'}:
+        # Added .mpg and .mpeg to the media player routing
+        elif path_obj.suffix.lower() in {'.mp4', '.mov', '.mpg', '.mpeg'}:
             self.preview_stack.setCurrentIndex(1)
             self.media_player.setSource(QUrl.fromLocalFile(file_path))
             self.media_player.play()
@@ -583,7 +659,6 @@ class ConcordDispatchApp(QMainWindow):
         size_mb = path_obj.stat().st_size / (1024 * 1024)
         self.lbl_preview_meta.setText(f"<b>File:</b> {path_obj.name}<br><b>Date:</b> {full_date}<br><b>Size:</b> {size_mb:.2f} MB")
 
-    # --- THE SECURE DISPATCH PREPARATION ---
     def prepare_dispatch(self):
         dest_dir = self.txt_dest_path.text()
         if not dest_dir or self.garner_model.rowCount() == 0: return
@@ -593,40 +668,29 @@ class ConcordDispatchApp(QMainWindow):
         schema_index = self.combo_schema.currentIndex()
         base_dest_path = Path(dest_dir)
         
-        # BUG FIX: Sanitize the Custom Tag so users don't accidentally crash the OS saving process
         raw_custom = self.txt_custom_tag.text().strip()
         custom_text = sanitize_filename(raw_custom)
         if raw_custom != custom_text:
-            QMessageBox.warning(self, "Invalid Characters", "Your Custom Tag contained illegal characters. They have been removed automatically.")
             self.txt_custom_tag.setText(custom_text)
 
         post_action = self.combo_post_action.currentIndex()
-        
-        # SECURITY: Hardware-Level Pre-Flight Checks for Wiping
         if post_action == 2:
             is_safe, warning_msg = is_safe_to_wipe(self.current_source_dir)
-            
             if not is_safe:
-                # If it's the boot drive, we don't even give them the option to proceed.
                 if "CRITICAL LOCKOUT" in warning_msg:
                     QMessageBox.critical(self, "Wipe Disabled", warning_msg)
                     self.combo_post_action.setCurrentIndex(0)
                     return
-                
-                # If it's just a warning (too large, or doesn't look removable), make them read it.
                 reply = QMessageBox.warning(self, "SECURITY WARNING", 
                                             f"{warning_msg}\n\nAre you absolutely sure you want to proceed with Wiping?",
-                                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Abort, 
-                                            QMessageBox.StandardButton.Abort)
+                                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Abort, QMessageBox.StandardButton.Abort)
                 if reply != QMessageBox.StandardButton.Yes:
                     self.combo_post_action.setCurrentIndex(0)
                     return
             else:
-                # Standard Warning
                 reply = QMessageBox.critical(self, "WARNING: DATA DELETION", 
                                             "You have selected to WIPE the source media.\nThe application will ONLY delete verified files.\n\nProceed?",
-                                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Abort, 
-                                            QMessageBox.StandardButton.Abort)
+                                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Abort, QMessageBox.StandardButton.Abort)
                 if reply != QMessageBox.StandardButton.Yes:
                     self.combo_post_action.setCurrentIndex(0)
                     return
@@ -646,6 +710,7 @@ class ConcordDispatchApp(QMainWindow):
 
             chosen_route = "[YYYY]/[MM]/[DD]"
             chosen_name = "" 
+            convert_ext = ""
 
             if schema_index == 0: chosen_route = "[YYYY]/[MM]/[DD]"
             elif schema_index == 1: chosen_route = "[YYYY]/[MM]"
@@ -654,29 +719,53 @@ class ConcordDispatchApp(QMainWindow):
                 chosen_route = self.advanced_schema.get("default_route", "[YYYY]/[MM]/[DD]")
                 chosen_name = self.advanced_schema.get("default_name", "")
                 
+                try: file_dt = datetime.strptime(full_date, "%Y-%m-%d %H:%M:%S")
+                except ValueError: file_dt = datetime.now() 
+                
                 for rule in self.advanced_schema.get("rules", []):
-                    rule_exts = [e.strip().lower() for e in rule.get("exts", "").split(",")]
-                    if file_obj.suffix.lower() in rule_exts or ext_clean in rule_exts:
+                    rule_matched = False
+                    r_val = rule.get("value", "")
+                    r_op = rule.get("operator", "")
+                    
+                    if rule.get("type") == "Extension":
+                        rule_exts = [e.strip().lower() for e in r_val.split(",")]
+                        if file_obj.suffix.lower() in rule_exts or ext_clean in rule_exts:
+                            rule_matched = True
+                            
+                    elif rule.get("type") == "Date Taken":
+                        try:
+                            target_dt = datetime.strptime(r_val, "%Y-%m-%d")
+                            if r_op == "is before" and file_dt < target_dt: rule_matched = True
+                            elif r_op == "is after" and file_dt > target_dt: rule_matched = True
+                            elif r_op == "is exactly" and file_dt.date() == target_dt.date(): rule_matched = True
+                        except ValueError: pass
+                    
+                    if rule_matched:
                         chosen_route = rule.get("route", chosen_route)
                         chosen_name = rule.get("name", chosen_name)
+                        convert_ext = rule.get("convert", "")
                         break 
                 
-            # BUG FIX: Strip leading slashes so `pathlib` doesn't treat the route as an absolute root directory
             chosen_route = chosen_route.lstrip("\\/")
             chosen_route = chosen_route.replace("[YYYY]", year).replace("[MM]", month).replace("[DD]", day).replace("[EXT]", ext_clean)
             target_dir = base_dest_path / chosen_route
 
+            final_ext = convert_ext.replace('.', '') if convert_ext else ext_clean
+
             final_name = file_obj.name
             if chosen_name:
                 new_name = chosen_name.replace("[YYYY]", year).replace("[MM]", month).replace("[DD]", day).replace("[CUSTOM]", custom_text).replace("[SEQ]", str(seq_counter).zfill(4))
-                final_name = f"{new_name}.{ext_clean}"
+                final_name = f"{new_name}.{final_ext}"
                 seq_counter += 1
+            elif convert_ext:
+                final_name = f"{file_obj.stem}.{final_ext}"
 
             dispatch_plan.append({
                 'src': src_file_path, 
                 'dest': target_dir / final_name,
                 'base_dest': base_dest_path, 
-                'date_full': full_date
+                'date_full': full_date,
+                'convert_ext': convert_ext 
             })
 
         if not dispatch_plan: return
@@ -690,13 +779,13 @@ class ConcordDispatchApp(QMainWindow):
     def start_dispatch_thread(self, dispatch_plan, post_action):
         self.btn_dispatch.setEnabled(False)
         self.progress_bar.setMaximum(len(dispatch_plan))
-        
         backup_path = self.txt_backup_path.text() if self.txt_backup_path.text() else None
         wipe_source = (post_action == 2)
         self.post_dispatch_action = post_action 
         
         self.worker = DispatchWorker(dispatch_plan, backup_path, wipe_source)
         self.worker.progress_update.connect(self.progress_bar.setValue)
+        self.worker.status_update.connect(self.lbl_garner_status.setText) 
         self.worker.finished.connect(self.on_dispatch_finished)
         self.worker.start()
 
