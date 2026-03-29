@@ -16,14 +16,30 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout,
                              QComboBox, QLineEdit, QFileDialog, 
                              QFrame, QMessageBox, QProgressBar, QDialog, 
                              QTableWidget, QTableWidgetItem, QHeaderView, QDialogButtonBox,
-                             QTableView, QListView, QSplitter, QStackedWidget, QSlider, QStyle, QGroupBox)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSortFilterProxyModel, QUrl, QSize
-from PyQt6.QtGui import QFileSystemModel, QStandardItemModel, QStandardItem, QPixmap
+                             QTableView, QListView, QSplitter, QStackedWidget, QSlider, 
+                             QStyle, QGroupBox, QCheckBox, QTextBrowser, QFormLayout, QSplashScreen)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSortFilterProxyModel, QUrl, QSize, QTimer, QPropertyAnimation
+from PyQt6.QtGui import QFileSystemModel, QStandardItemModel, QStandardItem, QPixmap, QIcon
 
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 
 # --- SECURITY & UTILITY ENGINES ---
+def get_resource_path(relative_path):
+    """Locates bundled files (like icons) whether running as a script or .exe"""
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.dirname(__file__), relative_path)
+
+def get_ffmpeg_path():
+    """Locates the ffmpeg executable whether running as a script or a compiled .exe"""
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, 'ffmpeg.exe')
+    else:
+        local_path = os.path.join(os.path.dirname(__file__), 'ffmpeg.exe')
+        if os.path.exists(local_path): return local_path
+        return 'ffmpeg'
+
 def sanitize_filename(name):
     return re.sub(r'[\\/*?:"<>|]', "", name)
 
@@ -79,7 +95,6 @@ class ScanWorker(QThread):
         super().__init__()
         self.source_dir = Path(source_dir)
     def run(self):
-        # Added .mpg and .mpeg support here
         media_extensions = {'.jpg', '.jpeg', '.png', '.mp4', '.mov', '.cr2', '.arw', '.mpg', '.mpeg'}
         found_count = 0
         self.status_update.emit("Scanning directories...")
@@ -106,22 +121,30 @@ class DispatchWorker(QThread):
     def run(self):
         success_count = 0
         total_count = len(self.dispatch_plan)
+        source_file_status = {} 
         
         for row, item in enumerate(self.dispatch_plan):
             src_file_path = item['src']
             primary_dest = item['dest']
             convert_ext = item.get('convert_ext', '') 
+            crf_val = item.get('crf', '22')
+            preset_val = item.get('preset', 'fast')
+            
+            if src_file_path not in source_file_status:
+                source_file_status[src_file_path] = True
             
             self.status_update.emit(f"Processing: {Path(src_file_path).name}")
 
             conversion_failed = False
             if convert_ext:
                 self.status_update.emit(f"Converting to {convert_ext.upper()}: {Path(src_file_path).name}...")
-                primary_success = self._convert_media(src_file_path, primary_dest, convert_ext)
+                primary_success = self._convert_media(src_file_path, primary_dest, convert_ext, crf_val, preset_val)
                 if not primary_success: conversion_failed = True
             else:
                 src_hash = calculate_sha256(src_file_path)
-                if not src_hash: continue
+                if not src_hash: 
+                    source_file_status[src_file_path] = False
+                    continue
                 primary_success = self._safe_copy(src_file_path, primary_dest, src_hash)
 
             backup_success = True
@@ -141,13 +164,19 @@ class DispatchWorker(QThread):
                 success_count += 1
                 final_hash = calculate_sha256(primary_dest)
                 self.audit_log.append({"filename": Path(primary_dest).name, "status": "SUCCESS", "hash": final_hash})
-                if self.wipe_source:
-                    try: os.remove(src_file_path)
-                    except Exception as e: print(f"Wipe failed: {e}")
             else:
+                source_file_status[src_file_path] = False
                 self.audit_log.append({"filename": Path(src_file_path).name, "status": "FAILED"})
                 
             self.progress_update.emit(row + 1)
+            
+        if self.wipe_source:
+            self.status_update.emit("Cleaning up verified source files...")
+            for src, is_safe_to_delete in source_file_status.items():
+                if is_safe_to_delete:
+                    try: os.remove(src)
+                    except Exception as e: print(f"Wipe failed for {src}: {e}")
+
         self.finished.emit(success_count, total_count, self.audit_log)
 
     def _safe_copy(self, src, dest, src_hash):
@@ -166,7 +195,7 @@ class DispatchWorker(QThread):
                 except: pass
             return False
 
-    def _convert_media(self, src, dest, ext):
+    def _convert_media(self, src, dest, ext, crf, preset):
         target_dir = Path(dest).parent
         target_dir.mkdir(parents=True, exist_ok=True)
         
@@ -175,45 +204,101 @@ class DispatchWorker(QThread):
                 with Image.open(src) as img:
                     if ext in {'.jpg', '.jpeg'} and img.mode in ('RGBA', 'P'):
                         img = img.convert('RGB')
-                    img.save(dest, quality=95)
+                    img_quality = 95 if crf == '18' else (85 if crf == '23' else 75)
+                    img.save(dest, quality=img_quality)
                 return True
             except Exception as e:
                 print(f"Image Conversion Error: {e}")
                 return False
                 
-        # Added .mpg and .mpeg support to the FFmpeg transcoder
         elif ext in {'.mp4', '.mov', '.mkv', '.mpg', '.mpeg'}:
             try:
-                command = ['ffmpeg', '-y', '-i', src, '-c:v', 'libx264', '-preset', 'fast', '-crf', '22', dest]
+                ffmpeg_exe = get_ffmpeg_path()
+                command = [ffmpeg_exe, '-y', '-i', src, '-c:v', 'libx264', '-preset', preset, '-crf', crf, dest]
                 subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
                 return True
             except FileNotFoundError:
-                print("FFmpeg not found! Please install FFmpeg to enable video conversion.")
+                print("FFmpeg not found! Please ensure ffmpeg.exe is bundled or in your PATH.")
                 return False
             except subprocess.CalledProcessError as e:
                 print(f"Video Conversion Error: {e}")
                 return False
         return False
 
-
 # --- DIALOGS ---
+class TutorialDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Concord Media Dispatch - User Guide")
+        self.resize(700, 500)
+        
+        layout = QVBoxLayout(self)
+        self.browser = QTextBrowser()
+        self.browser.setOpenExternalLinks(True)
+        
+        tutorial_html = """
+        <h2 style="color: #60CDFF;">Welcome to Concord Media Dispatch</h2>
+        <p>This application is a studio-grade Digital Asset Management (DAM) tool designed to securely ingest, verify, route, and transcode your media.</p>
+        
+        <h3>The 3-Step Workflow</h3>
+        <ol>
+            <li><b>FROM (Source):</b> Select your SD card or external hard drive on the left.</li>
+            <li><b>GARNER (Staging):</b> Click <b>Scan Source</b>. The app will quickly find all media, read its hidden EXIF date data, and queue it up. You can use the Grid View to cull your photos.</li>
+            <li><b>DISPATCH (Action):</b> Select where you want the files to go. Choose a Routing Schema, and hit Dispatch.</li>
+        </ol>
+
+        <h3>The Smart Schema Builder</h3>
+        <p>Instead of manually making folders, let Concord do the work. The Smart Schema uses natural language rules.</p>
+        <ul>
+            <li><b>Dynamic Tags:</b> Use tags like <code>[YYYY]</code> (Year), <code>[MM]</code> (Month), or <code>[CUSTOM]</code> to automatically name folders and files based on metadata.</li>
+            <li><b>Transcoding:</b> Need lightweight proxies? Tell a rule to convert <code>.mov</code> to <code>.mp4</code>. Concord will trigger FFmpeg in the background to safely compress your footage.</li>
+            <li><b>Double-Dipping:</b> Check the "Keep Original" box during a conversion to save the heavy master file to your default folder, while sending the converted proxy to a new folder.</li>
+        </ul>
+
+        <h3>Secure Gated Wiping</h3>
+        <p>If you choose to <b>WIPE SOURCE MEDIA</b>, Concord uses Cryptographic SHA-256 hashing. It copies the file, generates a mathematical fingerprint for the source and destination, and <b>only</b> deletes the original SD card file if the fingerprints are a perfect match.</p>
+        """
+        self.browser.setHtml(tutorial_html)
+        layout.addWidget(self.browser)
+        
+        btn_close = QPushButton("Got it. Let's get to work.")
+        btn_close.setMinimumHeight(40)
+        btn_close.clicked.connect(self.accept)
+        layout.addWidget(btn_close)
+
 class PreviewDialog(QDialog):
     def __init__(self, dispatch_plan, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Pre-Flight Review")
-        self.resize(1000, 500)
+        self.resize(1100, 500)
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("<b>Review Routing & Conversion Plan.</b>"))
+        
         self.table = QTableWidget()
-        self.table.setColumnCount(4) 
-        self.table.setHorizontalHeaderLabels(["Original File", "New Name", "Convert To", "Primary Destination"])
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.table.setColumnCount(5) 
+        self.table.setHorizontalHeaderLabels(["Thumb", "Original File", "New Name", "Convert To", "Primary Destination"])
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.table.verticalHeader().setDefaultSectionSize(60) 
+        self.table.setIconSize(QSize(50, 50))
         self.table.setRowCount(len(dispatch_plan))
+        
         for row, item in enumerate(dispatch_plan):
-            self.table.setItem(row, 0, QTableWidgetItem(Path(item['src']).name))
-            self.table.setItem(row, 1, QTableWidgetItem(Path(item['dest']).name))
-            self.table.setItem(row, 2, QTableWidgetItem(item.get('convert_ext', 'None')))
-            self.table.setItem(row, 3, QTableWidgetItem(str(Path(item['dest']).parent)))
+            src_path = item['src']
+            ext = Path(src_path).suffix.lower()
+            
+            thumb_item = QTableWidgetItem()
+            if ext in {'.jpg', '.jpeg', '.png'}:
+                pixmap = QPixmap(src_path).scaled(50, 50, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation)
+                thumb_item.setIcon(QIcon(pixmap))
+            elif ext in {'.mp4', '.mov', '.mpg', '.mpeg'}:
+                thumb_item.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaVolume))
+            
+            self.table.setItem(row, 0, thumb_item)
+            self.table.setItem(row, 1, QTableWidgetItem(Path(src_path).name))
+            self.table.setItem(row, 2, QTableWidgetItem(Path(item['dest']).name))
+            self.table.setItem(row, 3, QTableWidgetItem(item.get('convert_ext', 'None') or 'None'))
+            self.table.setItem(row, 4, QTableWidgetItem(str(Path(item['dest']).parent)))
+            
         layout.addWidget(self.table)
         self.btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         self.btn_box.accepted.connect(self.accept)
@@ -224,76 +309,91 @@ class SchemaEditorDialog(QDialog):
     def __init__(self, current_schema, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Smart Schema Builder")
-        self.resize(850, 600) 
+        self.resize(900, 650) 
         self.schema_data = current_schema 
 
         layout = QVBoxLayout(self)
         
-        def_group = QGroupBox("1. Default Behavior (If no special rules match)")
-        def_group.setToolTip("These settings apply if a file does not match any of the rules below.")
-        def_layout = QHBoxLayout()
-        def_layout.addWidget(QLabel("Route To:"))
+        def_group = QGroupBox("1. Default Master Routing")
+        def_layout = QFormLayout()
+        
         self.txt_def_route = QLineEdit(self.schema_data.get("default_route", "[YYYY]/[MM]/[DD]"))
-        self.txt_def_route.setToolTip("Dynamic folder creation. Use [YYYY], [MM], [EXT], etc.")
-        def_layout.addWidget(self.txt_def_route)
-        def_layout.addWidget(QLabel("Rename To:"))
         self.txt_def_name = QLineEdit(self.schema_data.get("default_name", "[YYYY][MM][DD]_[CUSTOM]_[SEQ]"))
+        
+        def_layout.addRow("Fallback Route:", self.txt_def_route)
+        def_layout.addRow("Fallback Rename:", self.txt_def_name)
         def_group.setLayout(def_layout)
         layout.addWidget(def_group)
 
-        list_group = QGroupBox("2. Active Smart Rules (Read from top to bottom)")
+        list_group = QGroupBox("2. Active Smart Rules")
         list_layout = QVBoxLayout()
         self.rule_list = QListView()
         self.rule_model = QStandardItemModel()
         self.rule_list.setModel(self.rule_model)
         list_layout.addWidget(self.rule_list)
-        btn_remove = QPushButton("- Remove Selected Rule")
+        btn_remove = QPushButton("Remove Selected Rule")
         btn_remove.clicked.connect(self.remove_rule)
         list_layout.addWidget(btn_remove)
         list_group.setLayout(list_layout)
         layout.addWidget(list_group)
 
-        build_group = QGroupBox("3. Build a New Rule")
-        build_layout = QVBoxLayout()
+        build_group = QGroupBox("3. Control Panel: Build New Rule")
+        build_layout = QFormLayout()
         
-        if_layout = QHBoxLayout()
-        if_layout.addWidget(QLabel("<b>IF</b>"))
+        if_widget = QWidget()
+        if_row = QHBoxLayout(if_widget)
+        if_row.setContentsMargins(0,0,0,0)
+        
         self.combo_type = QComboBox()
         self.combo_type.addItems(["Extension", "Date Taken"])
-        if_layout.addWidget(self.combo_type)
-        
         self.combo_operator = QComboBox()
         self.combo_operator.addItems(["is exactly", "is before", "is after"])
-        if_layout.addWidget(self.combo_operator)
-        
         self.txt_value = QLineEdit()
-        self.txt_value.setPlaceholderText("e.g. .mp4 or 2008-01-01")
-        if_layout.addWidget(self.txt_value)
-        build_layout.addLayout(if_layout)
+        self.txt_value.setPlaceholderText(".mp4 or 2008-01-01")
         
-        then_layout = QHBoxLayout()
-        then_layout.addWidget(QLabel("<b>THEN</b> Route To:"))
+        if_row.addWidget(self.combo_type)
+        if_row.addWidget(self.combo_operator)
+        if_row.addWidget(self.txt_value)
+        build_layout.addRow("IF Condition:", if_widget)
+        
         self.txt_rule_route = QLineEdit()
-        self.txt_rule_route.setPlaceholderText("e.g. Needs_Review/")
-        then_layout.addWidget(self.txt_rule_route)
-        
-        then_layout.addWidget(QLabel("Rename To:"))
         self.txt_rule_name = QLineEdit()
-        self.txt_rule_name.setPlaceholderText("Leave blank to keep original")
-        then_layout.addWidget(self.txt_rule_name)
+        self.txt_rule_name.setPlaceholderText("Leave blank to keep original filename")
+        build_layout.addRow("Route To:", self.txt_rule_route)
+        build_layout.addRow("Rename To:", self.txt_rule_name)
         
-        then_layout.addWidget(QLabel("Convert To:"))
+        convert_widget = QWidget()
+        convert_row = QHBoxLayout(convert_widget)
+        convert_row.setContentsMargins(0,0,0,0)
+        
         self.txt_rule_convert = QLineEdit()
-        self.txt_rule_convert.setPlaceholderText("e.g. .jpg or .mp4")
-        self.txt_rule_convert.setToolTip("Converts the media file. Requires FFmpeg for video. Leave blank to keep original format.")
-        then_layout.addWidget(self.txt_rule_convert)
+        self.txt_rule_convert.setPlaceholderText("e.g. .mp4")
+        self.txt_rule_convert.setMaximumWidth(100)
+        
+        self.combo_crf = QComboBox()
+        self.combo_crf.addItem("High Quality (18)", "18")
+        self.combo_crf.addItem("Standard (23)", "23")
+        self.combo_crf.addItem("Small Proxy (28)", "28")
+        
+        self.combo_preset = QComboBox()
+        self.combo_preset.addItems(["Fast", "Medium", "Slow"])
+        
+        convert_row.addWidget(self.txt_rule_convert)
+        convert_row.addWidget(QLabel(" Quality:"))
+        convert_row.addWidget(self.combo_crf)
+        convert_row.addWidget(QLabel(" Speed:"))
+        convert_row.addWidget(self.combo_preset)
+        
+        build_layout.addRow("Convert Ext:", convert_widget)
+        
+        self.chk_keep_original = QCheckBox("Double-Dip: Keep Original Master in Fallback Route")
+        build_layout.addRow("", self.chk_keep_original)
 
-        build_layout.addLayout(then_layout)
-
-        btn_add = QPushButton("+ Add Smart Rule")
-        btn_add.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
+        btn_add = QPushButton("Inject Smart Rule")
+        btn_add.setObjectName("addRuleBtn")
+        build_layout.addRow("", btn_add)
         btn_add.clicked.connect(self.add_rule)
-        build_layout.addWidget(btn_add)
+        
         build_group.setLayout(build_layout)
         layout.addWidget(build_group)
 
@@ -316,7 +416,9 @@ class SchemaEditorDialog(QDialog):
     def _add_rule_to_ui(self, rule_dict):
         sentence = f"IF {rule_dict['type']} {rule_dict['operator']} '{rule_dict['value']}' ➔ ROUTE: {rule_dict['route']}"
         if rule_dict.get('name'): sentence += f" | RENAME: {rule_dict['name']}"
-        if rule_dict.get('convert'): sentence += f" | CONVERT TO: {rule_dict['convert']}"
+        if rule_dict.get('convert'): 
+            sentence += f" | CONVERT TO: {rule_dict['convert']} (CRF:{rule_dict.get('crf','22')})"
+            if rule_dict.get('keep_original'): sentence += " (AND Keep Master)"
         item = QStandardItem(sentence)
         item.setData(rule_dict, Qt.ItemDataRole.UserRole) 
         self.rule_model.appendRow(item)
@@ -328,17 +430,26 @@ class SchemaEditorDialog(QDialog):
         r_route = self.txt_rule_route.text().strip()
         r_name = self.txt_rule_name.text().strip()
         r_convert = self.txt_rule_convert.text().strip().lower() 
+        r_crf = self.combo_crf.currentData()
+        r_preset = self.combo_preset.currentText().lower()
+        r_keep = self.chk_keep_original.isChecked()
         
         if not r_val or not r_route:
             QMessageBox.warning(self, "Missing Info", "You must provide a Value and a Route pattern.")
             return
             
-        new_rule = {"type": r_type, "operator": r_op, "value": r_val, "route": r_route, "name": r_name, "convert": r_convert}
+        new_rule = {
+            "type": r_type, "operator": r_op, "value": r_val, 
+            "route": r_route, "name": r_name, 
+            "convert": r_convert, "crf": r_crf, "preset": r_preset, 
+            "keep_original": r_keep
+        }
         self._add_rule_to_ui(new_rule)
         self.txt_value.clear()
         self.txt_rule_route.clear()
         self.txt_rule_name.clear()
         self.txt_rule_convert.clear()
+        self.chk_keep_original.setChecked(False)
 
     def remove_rule(self):
         for index in self.rule_list.selectedIndexes(): self.rule_model.removeRow(index.row())
@@ -376,14 +487,16 @@ class ConcordDispatchApp(QMainWindow):
         super().__init__()
         self.setWindowTitle("Concord Media Dispatch (Studio Edition)")
         self.resize(1350, 750) 
-        self.current_source_dir = None
         
+        self.setWindowIcon(QIcon(get_resource_path("media_dispatch.ico")))
+        
+        self.current_source_dir = None
         self.advanced_schema = {
             "default_route": "[YYYY]/[MM]/[DD]",
             "default_name": "[YYYY][MM][DD]_[CUSTOM]_[SEQ]",
             "rules": [
-                {"type": "Date Taken", "operator": "is before", "value": "2008-01-01", "route": "Flagged_Dates/", "name": "BAD_DATE_[SEQ]", "convert": ""},
-                {"type": "Extension", "operator": "is exactly", "value": ".mov, .mpg, .mpeg", "route": "Converted_Proxies/", "name": "[CUSTOM]_PROXY_[SEQ]", "convert": ".mp4"}
+                {"type": "Date Taken", "operator": "is before", "value": "2008-01-01", "route": "Flagged_Dates/", "name": "BAD_DATE_[SEQ]", "convert": "", "crf": "22", "preset": "fast", "keep_original": False},
+                {"type": "Extension", "operator": "is exactly", "value": ".mov, .mpg, .mpeg", "route": "Converted_Proxies/", "name": "[CUSTOM]_PROXY_[SEQ]", "convert": ".mp4", "crf": "28", "preset": "fast", "keep_original": True}
             ]
         }
 
@@ -393,12 +506,10 @@ class ConcordDispatchApp(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         main_layout.addWidget(splitter)
 
-        # --- Pane 1 ---
         from_pane_widget = QWidget()
         from_pane = QVBoxLayout(from_pane_widget)
         from_pane.addWidget(QLabel("<b>FROM: Source Drive</b>"))
         self.btn_select_source = QPushButton("Select Source...")
-        self.btn_select_source.setToolTip("Select the SD Card or external drive you want to ingest media from.")
         self.source_tree = QTreeView()
         self.file_model = QFileSystemModel()
         self.file_model.setRootPath("") 
@@ -408,10 +519,18 @@ class ConcordDispatchApp(QMainWindow):
         from_pane.addWidget(self.source_tree)
         splitter.addWidget(from_pane_widget)
 
-        # --- Pane 2 ---
         garner_pane_widget = QWidget()
         garner_pane = QVBoxLayout(garner_pane_widget)
-        garner_pane.addWidget(QLabel("<b>GARNER: Staging & Review</b>"))
+        
+        header_layout = QHBoxLayout()
+        header_layout.addWidget(QLabel("<b>GARNER: Staging & Review</b>"))
+        header_layout.addStretch()
+        self.btn_help = QPushButton("Help / Tutorial")
+        self.btn_help.setObjectName("helpBtn")
+        self.btn_help.clicked.connect(self.show_tutorial)
+        header_layout.addWidget(self.btn_help)
+        garner_pane.addLayout(header_layout)
+
         tools_layout = QHBoxLayout()
         self.txt_search = QLineEdit()
         self.txt_search.setPlaceholderText("Search files...")
@@ -448,6 +567,7 @@ class ConcordDispatchApp(QMainWindow):
         self.preview_stack.setMinimumHeight(280)
         self.lbl_preview_image = QLabel("No Preview")
         self.lbl_preview_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_preview_image.setObjectName("previewScreen")
         self.preview_stack.addWidget(self.lbl_preview_image)
 
         video_card = QWidget()
@@ -474,7 +594,6 @@ class ConcordDispatchApp(QMainWindow):
 
         self.lbl_preview_meta = QLabel("Metadata will appear here.")
         self.btn_scan_media = QPushButton("Scan Source")
-        self.btn_scan_media.setToolTip("Scans the selected source drive for images and video formats.")
         self.lbl_garner_status = QLabel("0 files queued")
 
         garner_pane.addWidget(self.btn_scan_media)
@@ -484,7 +603,6 @@ class ConcordDispatchApp(QMainWindow):
         garner_pane.addWidget(self.lbl_garner_status)
         splitter.addWidget(garner_pane_widget)
 
-        # --- Pane 3 ---
         dispatch_pane_widget = QWidget()
         dispatch_pane = QVBoxLayout(dispatch_pane_widget)
         dispatch_pane.addWidget(QLabel("<b>DISPATCH: Routing & Actions</b>"))
@@ -508,7 +626,6 @@ class ConcordDispatchApp(QMainWindow):
         schema_layout = QVBoxLayout()
         self.combo_schema = QComboBox()
         self.combo_schema.addItems(["Year / Month / Day", "Year / Month", "Flat Directory", "Smart Schema Builder..."])
-        self.combo_schema.setToolTip("Defines how folders are automatically created based on metadata.")
         self.btn_edit_schema = QPushButton("Configure Smart Schema...")
         self.btn_edit_schema.setVisible(False)
         self.btn_edit_schema.clicked.connect(self.open_schema_editor)
@@ -518,7 +635,6 @@ class ConcordDispatchApp(QMainWindow):
         schema_layout.addWidget(self.btn_edit_schema)
         schema_layout.addWidget(QLabel("Job Name / Custom Tag [CUSTOM]:"))
         self.txt_custom_tag = QLineEdit()
-        self.txt_custom_tag.setToolTip("Text entered here will replace the [CUSTOM] tag in your Smart Schema rules.")
         schema_layout.addWidget(self.txt_custom_tag)
         schema_group.setLayout(schema_layout)
         dispatch_pane.addWidget(schema_group)
@@ -526,9 +642,8 @@ class ConcordDispatchApp(QMainWindow):
         action_group = QGroupBox("Post-Dispatch Actions")
         action_layout = QVBoxLayout()
         self.combo_post_action = QComboBox()
-        self.combo_post_action.addItems(["Do Nothing (Default)", "Close Application", "⚠️ WIPE SOURCE MEDIA"])
-        self.combo_post_action.setStyleSheet("QComboBox QAbstractItemView::item:selected { background-color: darkred; }")
-        self.combo_post_action.setToolTip("Choose what the app does automatically after all files are verified.")
+        self.combo_post_action.addItems(["Do Nothing (Default)", "Close Application", "WIPE SOURCE MEDIA (DANGER)"])
+        self.combo_post_action.setObjectName("wipeWarningCombo")
         action_layout.addWidget(self.combo_post_action)
         action_group.setLayout(action_layout)
         dispatch_pane.addWidget(action_group)
@@ -536,17 +651,16 @@ class ConcordDispatchApp(QMainWindow):
         dispatch_pane.addStretch() 
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(False)
         self.btn_dispatch = QPushButton("DISPATCH SELECTED")
-        self.btn_dispatch.setToolTip("Executes your rules, conversions, copies, and verification.")
+        self.btn_dispatch.setObjectName("dispatchBtn")
         self.btn_dispatch.setMinimumHeight(50)
-        self.btn_dispatch.setStyleSheet("background-color: #2E8B57; color: white; font-weight: bold;")
         
         dispatch_pane.addWidget(self.progress_bar)
         dispatch_pane.addWidget(self.btn_dispatch)
         splitter.addWidget(dispatch_pane_widget)
         splitter.setSizes([250, 600, 350])
 
-        # Events
         self.btn_select_source.clicked.connect(self.select_source)
         self.source_tree.clicked.connect(self.on_tree_clicked)
         self.btn_scan_media.clicked.connect(self.start_scan_thread)
@@ -564,6 +678,10 @@ class ConcordDispatchApp(QMainWindow):
         self.media_player.positionChanged.connect(self.slider_video.setValue)
         self.media_player.durationChanged.connect(self.slider_video.setMaximum)
         self.slider_video.sliderMoved.connect(self.media_player.setPosition)
+
+    def show_tutorial(self):
+        dialog = TutorialDialog(self)
+        dialog.exec()
 
     def select_source(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Source")
@@ -604,11 +722,13 @@ class ConcordDispatchApp(QMainWindow):
         item_name.setData(full_path, Qt.ItemDataRole.UserRole)
         item_name.setCheckable(True)
         item_name.setCheckState(Qt.CheckState.Checked) 
+        
         if ext in {'.jpg', '.jpeg', '.png'}:
-            item_name.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon))
-        # Added .mpg and .mpeg to UI video icons
+            pixmap = QPixmap(full_path).scaled(100, 100, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation)
+            item_name.setIcon(QIcon(pixmap))
         elif ext in {'.mp4', '.mov', '.mpg', '.mpeg'}:
             item_name.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaVolume))
+            
         item_ext = QStandardItem(ext)
         item_date = QStandardItem(full_date)
         item_path = QStandardItem(full_path)
@@ -617,7 +737,7 @@ class ConcordDispatchApp(QMainWindow):
     def on_scan_finished(self, count):
         self.btn_scan_media.setEnabled(True)
         self.garner_table.resizeColumnsToContents()
-        self.lbl_garner_status.setText(f"✅ {count} media files queued.")
+        self.lbl_garner_status.setText(f"Scan complete: {count} media files queued.")
 
     def toggle_all_checkmarks(self):
         if self.garner_model.rowCount() == 0: return
@@ -650,7 +770,6 @@ class ConcordDispatchApp(QMainWindow):
             pixmap = QPixmap(file_path)
             pixmap = pixmap.scaled(self.lbl_preview_image.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             self.lbl_preview_image.setPixmap(pixmap)
-        # Added .mpg and .mpeg to the media player routing
         elif path_obj.suffix.lower() in {'.mp4', '.mov', '.mpg', '.mpeg'}:
             self.preview_stack.setCurrentIndex(1)
             self.media_player.setSource(QUrl.fromLocalFile(file_path))
@@ -711,13 +830,19 @@ class ConcordDispatchApp(QMainWindow):
             chosen_route = "[YYYY]/[MM]/[DD]"
             chosen_name = "" 
             convert_ext = ""
+            crf_val = "22"
+            preset_val = "fast"
+            keep_original = False
 
             if schema_index == 0: chosen_route = "[YYYY]/[MM]/[DD]"
             elif schema_index == 1: chosen_route = "[YYYY]/[MM]"
             elif schema_index == 2: chosen_route = ""
             elif schema_index == 3: 
-                chosen_route = self.advanced_schema.get("default_route", "[YYYY]/[MM]/[DD]")
-                chosen_name = self.advanced_schema.get("default_name", "")
+                def_route_raw = self.advanced_schema.get("default_route", "[YYYY]/[MM]/[DD]")
+                def_name_raw = self.advanced_schema.get("default_name", "")
+                
+                chosen_route = def_route_raw
+                chosen_name = def_name_raw
                 
                 try: file_dt = datetime.strptime(full_date, "%Y-%m-%d %H:%M:%S")
                 except ValueError: file_dt = datetime.now() 
@@ -729,8 +854,7 @@ class ConcordDispatchApp(QMainWindow):
                     
                     if rule.get("type") == "Extension":
                         rule_exts = [e.strip().lower() for e in r_val.split(",")]
-                        if file_obj.suffix.lower() in rule_exts or ext_clean in rule_exts:
-                            rule_matched = True
+                        if file_obj.suffix.lower() in rule_exts or ext_clean in rule_exts: rule_matched = True
                             
                     elif rule.get("type") == "Date Taken":
                         try:
@@ -744,7 +868,27 @@ class ConcordDispatchApp(QMainWindow):
                         chosen_route = rule.get("route", chosen_route)
                         chosen_name = rule.get("name", chosen_name)
                         convert_ext = rule.get("convert", "")
+                        crf_val = rule.get("crf", "22")
+                        preset_val = rule.get("preset", "fast")
+                        keep_original = rule.get("keep_original", False)
                         break 
+                
+                if convert_ext and keep_original:
+                    orig_route = def_route_raw.lstrip("\\/").replace("[YYYY]", year).replace("[MM]", month).replace("[DD]", day).replace("[EXT]", ext_clean)
+                    orig_target = base_dest_path / orig_route
+                    orig_final_name = file_obj.name
+                    if def_name_raw:
+                        new_n = def_name_raw.replace("[YYYY]", year).replace("[MM]", month).replace("[DD]", day).replace("[CUSTOM]", custom_text).replace("[SEQ]", str(seq_counter).zfill(4))
+                        orig_final_name = f"{new_n}.{ext_clean}"
+                        seq_counter += 1
+                        
+                    dispatch_plan.append({
+                        'src': src_file_path, 
+                        'dest': orig_target / orig_final_name,
+                        'base_dest': base_dest_path, 
+                        'date_full': full_date,
+                        'convert_ext': "" 
+                    })
                 
             chosen_route = chosen_route.lstrip("\\/")
             chosen_route = chosen_route.replace("[YYYY]", year).replace("[MM]", month).replace("[DD]", day).replace("[EXT]", ext_clean)
@@ -765,7 +909,9 @@ class ConcordDispatchApp(QMainWindow):
                 'dest': target_dir / final_name,
                 'base_dest': base_dest_path, 
                 'date_full': full_date,
-                'convert_ext': convert_ext 
+                'convert_ext': convert_ext,
+                'crf': crf_val,
+                'preset': preset_val
             })
 
         if not dispatch_plan: return
@@ -805,9 +951,149 @@ class ConcordDispatchApp(QMainWindow):
             self.lbl_garner_status.setText("Dispatch and Wiping complete.")
             self.start_scan_thread()
 
+win11_dark_stylesheet = """
+QMainWindow, QDialog {
+    background-color: #202020;
+    color: #ffffff;
+    font-family: 'Segoe UI Variable', 'Segoe UI', sans-serif;
+    font-size: 10pt;
+}
+QWidget {
+    color: #ffffff;
+}
+QPushButton {
+    background-color: #2d2d2d;
+    border: 1px solid #3d3d3d;
+    border-radius: 4px;
+    padding: 6px 12px;
+    color: #ffffff;
+}
+QPushButton:hover {
+    background-color: #323232;
+}
+QPushButton:pressed {
+    background-color: #282828;
+}
+QPushButton#dispatchBtn {
+    background-color: #005fb8;
+    border: 1px solid #005fb8;
+    border-radius: 6px;
+    font-weight: bold;
+    font-size: 11pt;
+}
+QPushButton#dispatchBtn:hover {
+    background-color: #0056a6;
+}
+QPushButton#addRuleBtn, QPushButton#helpBtn {
+    background-color: #2d2d2d;
+    border: 1px solid #3d3d3d;
+}
+QGroupBox {
+    border: 1px solid #3d3d3d;
+    border-radius: 8px;
+    margin-top: 1.5em;
+    padding-top: 10px;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 10px;
+    padding: 0 3px;
+    color: #ffffff;
+}
+QLineEdit, QComboBox, QTableView, QListView, QTextBrowser {
+    background-color: #1e1e1e;
+    border: 1px solid #3d3d3d;
+    border-radius: 4px;
+    padding: 4px;
+    color: #ffffff;
+    selection-background-color: #005fb8;
+}
+QLineEdit:focus, QComboBox:focus {
+    border: 1px solid #005fb8;
+}
+QComboBox::drop-down {
+    border: none;
+}
+QProgressBar {
+    border: 1px solid #3d3d3d;
+    border-radius: 4px;
+    background-color: #1e1e1e;
+    text-align: center;
+}
+QProgressBar::chunk {
+    background-color: #005fb8;
+    border-radius: 3px;
+}
+QLabel#previewScreen {
+    background-color: #111111;
+    border: 1px solid #3d3d3d;
+    border-radius: 4px;
+}
+QHeaderView::section {
+    background-color: #2d2d2d;
+    padding: 4px;
+    border: none;
+    border-right: 1px solid #3d3d3d;
+    border-bottom: 1px solid #3d3d3d;
+}
+"""
+
 if __name__ == "__main__":
+    if os.name == 'nt':
+        myappid = 'concord.media.dispatch.studio.1'
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+        
     app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(get_resource_path("media_dispatch.ico")))
+    
+    # --- THE FADING SPLASH SCREEN ---
+    splash_pixmap = QPixmap(get_resource_path("media-dispatch-logo.png"))
+    splash_pixmap = splash_pixmap.scaled(800, 600, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+    splash = QSplashScreen(splash_pixmap, Qt.WindowType.WindowStaysOnTopHint)
+    
+    # Start transparent
+    splash.setWindowOpacity(0.0)
+    splash.show()
+    app.processEvents() 
+    
+    # Build main window
     app.setStyle("Fusion") 
+    app.setStyleSheet(win11_dark_stylesheet)
     window = ConcordDispatchApp()
-    window.show()
+    
+    # Animation Setup
+    fade_in = QPropertyAnimation(splash, b"windowOpacity")
+    fade_in.setDuration(1000) 
+    fade_in.setStartValue(0.0)
+    fade_in.setEndValue(1.0)
+    
+    fade_out = QPropertyAnimation(splash, b"windowOpacity")
+    fade_out.setDuration(1000) 
+    fade_out.setStartValue(1.0)
+    fade_out.setEndValue(0.0)
+
+    # Click to skip
+    def skip_splash(event=None):
+        fade_in.stop()
+        fade_out.stop()
+        splash.close()
+        window.show()
+
+    splash.mousePressEvent = skip_splash
+
+    # Sequence chain
+    def start_fade_out():
+        fade_out.start()
+
+    def finish_startup():
+        splash.close()
+        window.show()
+
+    fade_in.finished.connect(lambda: QTimer.singleShot(2000, start_fade_out))
+    fade_out.finished.connect(finish_startup)
+
+    # Ignite sequence
+    fade_in.start()
+    
     sys.exit(app.exec())
